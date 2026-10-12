@@ -52,15 +52,22 @@
   tbody tr:hover { background: var(--row-hover); }
   code { font-size: .8rem; color: var(--muted); }
   #error { color: #cf222e; }
+  #photo-status { color: var(--muted); font-size: .85rem; margin: -12px 0 20px; }
+  .photo-popup { width: 280px; }
+  .photo-popup img {
+    display: block; width: 100%; min-height: 120px; border-radius: 4px; background: #ddd;
+  }
+  .photo-popup .meta { margin: 6px 0 2px; color: #555; font-size: .8rem; }
 </style>
 </head>
 <body>
 <main>
   <h1>撮影シーケンス一覧</h1>
-  <p class="sub">collection.csv の内容を地図と表で表示しています。行をクリックすると地図がその位置へ移動します。</p>
+  <p class="sub">collection.csv の内容を地図と表で表示しています。地図上の点をクリックすると、Panoramax にアップロードした写真が表示されます。表の行をクリックすると地図がその位置へ移動します。</p>
 
   <div class="stats" id="stats"></div>
   <div id="map"></div>
+  <p id="photo-status"></p>
 
   <div class="toolbar">
     <input id="filter" type="search" placeholder="名前・日付・ID で絞り込み">
@@ -119,21 +126,76 @@ function renderStats() {
     .map(([k, v]) => `<div class="stat"><div class="v">${esc(v)}</div><div class="k">${k}</div></div>`).join("");
 }
 
+// シーケンスごとの地図レイヤー。写真を読み込めたら写真の点に置き換える。
+const seqLayers = {};
+
 function renderMap() {
   const bounds = [];
   rows.forEach(r => {
     const sw = [+r.min_y, +r.min_x], ne = [+r.max_y, +r.max_x];
     bounds.push(sw, ne);
     const popup = `<b>${esc(r.name)}</b><br>${esc(r.capture_date)} ・ 写真 ${esc(r.nb_pictures)} 枚`;
-    if (sw[0] === ne[0] && sw[1] === ne[1]) {
-      L.circleMarker(sw, { radius: 6, weight: 2 }).bindPopup(popup).addTo(map);
-    } else {
-      L.rectangle([sw, ne], { weight: 2 }).bindPopup(popup).addTo(map);
-    }
+    const layer = sw[0] === ne[0] && sw[1] === ne[1]
+      ? L.circleMarker(sw, { radius: 6, weight: 2 })
+      : L.rectangle([sw, ne], { weight: 2 });
+    seqLayers[r.id] = layer.bindPopup(popup).addTo(map);
   });
   if (bounds.length) map.fitBounds(bounds, { padding: [20, 20] });
   else map.setView([0, 0], 2);
 }
+
+// Panoramax の API（STAC 形式）から各シーケンスの写真を取得する。
+const PANORAMAX = "https://panoramax.openstreetmap.fr";
+
+function photoPopup(r, f) {
+  const a = f.assets || {};
+  const img = (a.thumb || a.sd || a.hd || {}).href;
+  const full = (a.hd || a.sd || a.thumb || {}).href;
+  const [lon, lat] = f.geometry.coordinates;
+  const when = (f.properties.datetime || "").replace("T", " ").slice(0, 19);
+  const viewer = `${PANORAMAX}/#focus=pic&pic=${encodeURIComponent(f.id)}&map=19/${lat}/${lon}`;
+  return `<div class="photo-popup">
+    <a href="${esc(full)}" target="_blank" rel="noopener"><img src="${esc(img)}" alt="撮影写真"></a>
+    <div class="meta"><b>${esc(r.name)}</b><br>${esc(when)} (UTC)</div>
+    <a href="${esc(full)}" target="_blank" rel="noopener">高解像度で開く</a> ・
+    <a href="${esc(viewer)}" target="_blank" rel="noopener">Panoramax で見る</a>
+  </div>`;
+}
+
+async function loadPhotos(r) {
+  const res = await fetch(`${PANORAMAX}/api/collections/${encodeURIComponent(r.id)}/items?limit=100`);
+  if (!res.ok) throw new Error(res.status);
+  const feats = ((await res.json()).features || []).filter(f => f.geometry && f.geometry.type === "Point");
+  if (!feats.length) return 0;
+  const group = L.featureGroup();
+  const line = feats.map(f => [f.geometry.coordinates[1], f.geometry.coordinates[0]]);
+  if (line.length > 1) L.polyline(line, { weight: 3, opacity: .6 }).addTo(group);
+  feats.forEach((f, i) => {
+    L.circleMarker(line[i], { radius: 7, weight: 2, fillColor: "#fff", fillOpacity: 1 })
+      .bindPopup(photoPopup(r, f), { minWidth: 280, maxWidth: 300 })
+      .addTo(group);
+  });
+  map.removeLayer(seqLayers[r.id]);
+  seqLayers[r.id] = group.addTo(map);
+  return feats.length;
+}
+
+async function loadAllPhotos() {
+  const status = document.getElementById("photo-status");
+  status.textContent = "Panoramax から写真を読み込み中…";
+  const results = await Promise.allSettled(rows.map(loadPhotos));
+  const ok = results.filter(x => x.status === "fulfilled");
+  const pics = ok.reduce((s, x) => s + x.value, 0);
+  status.textContent = ok.length === rows.length
+    ? `Panoramax の写真 ${pics} 枚を地図に表示しています。`
+    : `Panoramax の写真 ${pics} 枚を表示しています（${rows.length - ok.length} 件のシーケンスは写真を取得できませんでした）。`;
+}
+
+// 写真の読み込みが終わったらポップアップの大きさを合わせ直す。
+map.on("popupopen", e => {
+  const img = e.popup.getElement().querySelector("img");
+  if (img && !img.complete) img.addEventListener("load", () => e.popup.update(), { once: true });
+});
 
 function renderHead() {
   document.getElementById("head").innerHTML = COLUMNS.map(c => {
@@ -182,6 +244,7 @@ function show(text) {
   const res = Papa.parse(text, { header: true, skipEmptyLines: true });
   rows = res.data.filter(r => r.id);
   renderStats(); renderMap(); renderHead(); renderBody();
+  loadAllPhotos();
 }
 
 // GitHub Pages では collection.csv を読み込む。ファイルを直接開いた場合など
