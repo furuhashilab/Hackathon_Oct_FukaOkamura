@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>撮影シーケンス一覧</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #f7f7f5; --fg: #1f2328; --muted: #656d76; --card: #ffffff;
+    --border: #d8dee4; --accent: #0969da; --row-hover: #f0f4fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --card: #161b22;
+      --border: #30363d; --accent: #4493f8; --row-hover: #1c2330;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    line-height: 1.5;
+  }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+  .stat {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 16px; min-width: 140px;
+  }
+  .stat .v { font-size: 1.4rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--muted); font-size: .85rem; }
+  #map {
+    height: 420px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 20px;
+  }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .toolbar input {
+    flex: 1 1 220px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card); color: var(--fg); font: inherit;
+  }
+  .toolbar a { color: var(--accent); text-decoration: none; white-space: nowrap; }
+  .table-wrap {
+    overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: .875rem; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--card); cursor: pointer; user-select: none; }
+  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--row-hover); }
+  code { font-size: .8rem; color: var(--muted); }
+  #error { color: #cf222e; }
+</style>
+</head>
+<body>
+<main>
+  <h1>撮影シーケンス一覧</h1>
+  <p class="sub">collection.csv の内容を地図と表で表示しています。行をクリックすると地図がその位置へ移動します。</p>
+
+  <div class="stats" id="stats"></div>
+  <div id="map"></div>
+
+  <div class="toolbar">
+    <input id="filter" type="search" placeholder="名前・日付・ID で絞り込み">
+    <a href="collection.csv" download>CSV をダウンロード</a>
+  </div>
+  <p id="error"></p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr id="head"></tr></thead>
+      <tbody id="body"></tbody>
+    </table>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script>
+const COLUMNS = [
+  { key: "name", label: "名前" },
+  { key: "capture_date", label: "撮影日" },
+  { key: "minimum_capture_time", label: "撮影開始 (UTC)", fmt: v => v.slice(0, 19) },
+  { key: "maximum_capture_time", label: "撮影終了 (UTC)", fmt: v => v.slice(0, 19) },
+  { key: "nb_pictures", label: "写真数", num: true },
+  { key: "length_km", label: "距離 (km)", num: true },
+  { key: "computed_gps_accuracy", label: "GPS 精度 (m)", num: true, fmt: v => v === "" ? "" : Number(v).toFixed(1) },
+  { key: "status", label: "状態" },
+  { key: "id", label: "ID", fmt: v => `<code>${v}</code>` },
+];
+
+const map = L.map("map");
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+}).addTo(map);
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+let rows = [];
+let sortKey = "minimum_capture_time", sortAsc = true;
+
+function center(r) {
+  return [(+r.min_y + +r.max_y) / 2, (+r.min_x + +r.max_x) / 2];
+}
+
+function renderStats() {
+  const pics = rows.reduce((s, r) => s + (+r.nb_pictures || 0), 0);
+  const km = rows.reduce((s, r) => s + (+r.length_km || 0), 0);
+  const dates = rows.map(r => r.capture_date).sort();
+  const stats = [
+    ["シーケンス数", rows.length],
+    ["写真数", pics],
+    ["合計距離", km.toFixed(2) + " km"],
+    ["撮影期間", dates.length ? `${dates[0]} 〜 ${dates[dates.length - 1]}` : "-"],
+  ];
+  document.getElementById("stats").innerHTML = stats
+    .map(([k, v]) => `<div class="stat"><div class="v">${esc(v)}</div><div class="k">${k}</div></div>`).join("");
+}
+
+function renderMap() {
+  const bounds = [];
+  rows.forEach(r => {
+    const sw = [+r.min_y, +r.min_x], ne = [+r.max_y, +r.max_x];
+    bounds.push(sw, ne);
+    const popup = `<b>${esc(r.name)}</b><br>${esc(r.capture_date)} ・ 写真 ${esc(r.nb_pictures)} 枚`;
+    if (sw[0] === ne[0] && sw[1] === ne[1]) {
+      L.circleMarker(sw, { radius: 6, weight: 2 }).bindPopup(popup).addTo(map);
+    } else {
+      L.rectangle([sw, ne], { weight: 2 }).bindPopup(popup).addTo(map);
+    }
+  });
+  if (bounds.length) map.fitBounds(bounds, { padding: [20, 20] });
+  else map.setView([0, 0], 2);
+}
+
+function renderHead() {
+  document.getElementById("head").innerHTML = COLUMNS.map(c => {
+    const arrow = c.key === sortKey ? (sortAsc ? " ▲" : " ▼") : "";
+    return `<th class="${c.num ? "num" : ""}" data-key="${c.key}">${c.label}${arrow}</th>`;
+  }).join("");
+}
+
+function renderBody() {
+  const q = document.getElementById("filter").value.trim().toLowerCase();
+  const col = COLUMNS.find(c => c.key === sortKey);
+  const list = rows
+    .filter(r => !q || COLUMNS.some(c => String(r[c.key]).toLowerCase().includes(q)))
+    .sort((a, b) => {
+      let x = a[sortKey], y = b[sortKey];
+      if (col && col.num) { x = x === "" ? -Infinity : +x; y = y === "" ? -Infinity : +y; }
+      return (x < y ? -1 : x > y ? 1 : 0) * (sortAsc ? 1 : -1);
+    });
+  document.getElementById("body").innerHTML = list.map(r =>
+    `<tr data-id="${esc(r.id)}">` + COLUMNS.map(c => {
+      const v = r[c.key] ?? "";
+      return `<td class="${c.num ? "num" : ""}">${c.fmt ? c.fmt(esc(v)) : esc(v)}</td>`;
+    }).join("") + "</tr>"
+  ).join("");
+}
+
+document.getElementById("head").addEventListener("click", e => {
+  const th = e.target.closest("th");
+  if (!th) return;
+  if (sortKey === th.dataset.key) sortAsc = !sortAsc;
+  else { sortKey = th.dataset.key; sortAsc = true; }
+  renderHead(); renderBody();
+});
+
+document.getElementById("body").addEventListener("click", e => {
+  const tr = e.target.closest("tr");
+  const r = tr && rows.find(x => x.id === tr.dataset.id);
+  if (!r) return;
+  map.setView(center(r), 18);
+  document.getElementById("map").scrollIntoView({ behavior: "smooth", block: "center" });
+});
+
+document.getElementById("filter").addEventListener("input", renderBody);
+
+Papa.parse("collection.csv", {
+  download: true,
+  header: true,
+  skipEmptyLines: true,
+  complete: res => {
+    rows = res.data.filter(r => r.id);
+    renderStats(); renderMap(); renderHead(); renderBody();
+  },
+  error: err => {
+    document.getElementById("error").textContent = "CSV の読み込みに失敗しました: " + err;
+  },
+});
+</script>
+</body>
+</html>
